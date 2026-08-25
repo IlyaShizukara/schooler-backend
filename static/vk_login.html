@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <title>Вход через VK ID</title>
+  <style>
+    body { background:#0A0A12; color:#F5F5F7; font-family:sans-serif;
+           display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; }
+    #status { margin-top:16px; font-size:14px; color:#8B8B9E; }
+  </style>
+</head>
+<body>
+  <div id="vkid-container"></div>
+  <p id="status"></p>
+
+  <script src="https://unpkg.com/@vkid/sdk@<3.0.0/dist-sdk/umd/index.js"></script>
+  <script type="text/javascript">
+    if ('VKIDSDK' in window) {
+      const VKID = window.VKIDSDK;
+      VKID.Config.init({
+        app: 54717620,
+        redirectUrl: 'https://myschooler.ru/tg-webapp/vk_login.html',
+        responseMode: VKID.ConfigResponseMode.Callback,
+        source: VKID.ConfigSource.LOWCODE,
+        scope: '',
+      });
+
+      const oneTap = new VKID.OneTap();
+      oneTap.render({
+        container: document.getElementById('vkid-container'),
+        showAlternativeLogin: true,
+        styles: { borderRadius: 20 },
+        oauthList: ['ok_ru', 'mail_ru'],
+      })
+        .on(VKID.WidgetEvents.ERROR, vkidOnError)
+        .on(VKID.OneTapInternalEvents.LOGIN_SUCCESS, function (payload) {
+          const code = payload.code;
+          const deviceId = payload.device_id;
+          VKID.Auth.exchangeCode(code, deviceId)
+            .then(vkidOnSuccess)
+            .catch(vkidOnError);
+        });
+
+      function vkidOnSuccess(data) {
+        // Не доверяем данным от клиента вслепую — отправляем на бэкенд,
+        // где access_token будет перепроверен запросом к самому VK API.
+        document.getElementById('status').textContent = 'Входим...';
+        const params = new URLSearchParams(window.location.search);
+        const linkToken = params.get('link_token');
+        fetch('/api/auth/vk/webapp', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            access_token: data.access_token,
+            user_id: data.user_id,
+            link_token: linkToken,
+            }),
+        })
+          .then(r => r.json())
+          .then(res => {
+            if (res.session_token) {
+              window.location.href = 'https://myschooler.ru/?wa_token=' + encodeURIComponent(res.session_token);
+            } else {
+              document.getElementById('status').textContent =
+                res.detail || 'VK ID не привязан ни к одному аккаунту Schooler. Сначала войдите через Telegram и привяжите VK ID в профиле.';
+            }
+          })
+          .catch(() => {
+            document.getElementById('status').textContent = 'Ошибка соединения.';
+          });
+      }
+
+      function vkidOnError(error) {
+        document.getElementById('status').textContent = 'Не удалось войти через VK.';
+        console.error(error);
+      }
+    }
+  </script>
+</body>
+</html>
