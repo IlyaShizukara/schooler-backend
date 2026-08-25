@@ -60,11 +60,18 @@ async def lifespan(app: FastAPI):
     await bot_app.initialize()
     await bot_app.start()
     webhook_url = f"{settings.public_base_url.rstrip('/')}/api/telegram/webhook"
-    await bot_app.bot.set_webhook(
-        url=webhook_url,
-        secret_token=settings.telegram_webhook_secret,
-        allowed_updates=Update.ALL_TYPES,
-    )
+    try:
+        await bot_app.bot.set_webhook(
+            url=webhook_url,
+            secret_token=settings.telegram_webhook_secret,
+            allowed_updates=Update.ALL_TYPES,
+        )
+    except Exception as exc:
+        # Если Telegram недоступен на холодном старте (или PUBLIC_BASE_URL
+        # окажется неправильным) — не роняем весь бэкенд из-за этого, просто
+        # логируем. Без этого один сбой set_webhook укладывал 500-кой ВСЕ
+        # роуты API, не только бота.
+        print(f"[bot] не удалось зарегистрировать webhook ({webhook_url}): {exc}")
     try:
         yield
     finally:
@@ -108,13 +115,27 @@ app.include_router(yandex_auth_router)
 # читает то, что закоммичено) — это сломается на Vercel. Такие файлы нужно
 # заранее перенести в объектное хранилище (например, то же, что уже
 # используется для формул/аудио на selstorage.ru, или Supabase Storage).
-os.makedirs("static/images", exist_ok=True)
-app.mount("/images", StaticFiles(directory="static/images"), name="images")
+#
+# Дополнительно: рантайм на Vercel может быть read-only, и если этих папок
+# нет в самом репозитории на момент деплоя — os.makedirs упадёт с
+# исключением на уровне ИМПОРТА МОДУЛЯ, а значит любой роут API отдаст 500,
+# даже никак не связанный со статикой. Оборачиваем в try/except, чтобы сбой
+# монтирования статики не ронял весь бэкенд целиком.
+def _mount_static(path: str, directory: str, name: str) -> None:
+    try:
+        os.makedirs(directory, exist_ok=True)
+        app.mount(path, StaticFiles(directory=directory), name=name)
+    except OSError as exc:
+        print(f"[static] не удалось подключить {path} -> {directory}: {exc}")
 
-os.makedirs("static/kompege_images", exist_ok=True)
-app.mount("/kompege-images", StaticFiles(directory="static/kompege_images"), name="kompege_images")
 
-app.mount("/tg-webapp", StaticFiles(directory="static", html=True), name="tg_webapp")
+_mount_static("/images", "static/images", "images")
+_mount_static("/kompege-images", "static/kompege_images", "kompege_images")
+
+try:
+    app.mount("/tg-webapp", StaticFiles(directory="static", html=True), name="tg_webapp")
+except (OSError, RuntimeError) as exc:
+    print(f"[static] не удалось подключить /tg-webapp: {exc}")
 
 
 @app.post("/api/telegram/webhook")
