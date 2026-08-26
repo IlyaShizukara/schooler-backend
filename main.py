@@ -61,11 +61,20 @@ async def lifespan(app: FastAPI):
     await bot_app.start()
     webhook_url = f"{settings.public_base_url.rstrip('/')}/api/telegram/webhook"
     try:
-        await bot_app.bot.set_webhook(
-            url=webhook_url,
-            secret_token=settings.telegram_webhook_secret,
-            allowed_updates=Update.ALL_TYPES,
-        )
+        # Сначала read-only проверка — если вебхук уже указывает на нужный
+        # URL, ничего не переотправляем. Без этой проверки КАЖДЫЙ холодный
+        # старт функции звал set_webhook заново; если Vercel поднимает
+        # несколько инстансов почти одновременно (всплеск трафика/деплой),
+        # параллельные set_webhook попадают под flood control Telegram
+        # (429 Too Many Requests). get_webhook_info такому лимиту не
+        # подвержен так жёстко.
+        current = await bot_app.bot.get_webhook_info()
+        if current.url != webhook_url:
+            await bot_app.bot.set_webhook(
+                url=webhook_url,
+                secret_token=settings.telegram_webhook_secret,
+                allowed_updates=Update.ALL_TYPES,
+            )
     except Exception as exc:
         # Если Telegram недоступен на холодном старте (или PUBLIC_BASE_URL
         # окажется неправильным) — не роняем весь бэкенд из-за этого, просто
