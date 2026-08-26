@@ -17,6 +17,8 @@ class Base(DeclarativeBase):
 #   - остальные подобные параметры (channel_binding и любые новые, которые
 #     появятся в будущем) -> просто убираем из URL, asyncpg их не поддерживает
 #     и не может использовать через query string.
+# Это же справедливо и для Supabase — их connection string тоже иногда
+# включает sslmode/channel_binding, логика ниже общая для обоих провайдеров.
 _LIBPQ_ONLY_PARAMS = ["sslmode", "channel_binding", "target_session_attrs", "options"]
 
 _url = make_url(settings.database_url)
@@ -27,6 +29,21 @@ if _url.query.get("sslmode") in ("require", "verify-ca", "verify-full"):
 _params_to_strip = [p for p in _LIBPQ_ONLY_PARAMS if p in _url.query]
 if _params_to_strip:
     _url = _url.difference_update_query(_params_to_strip)
+
+# ⚠️ ВАЖНО ПРИ ПЕРЕЕЗДЕ НА SUPABASE: если DATABASE_URL указывает на их
+# transaction-mode пулер (Supavisor/pgbouncer, порт 6543 — именно его нужно
+# использовать на serverless/Vercel, чтобы не упереться в лимит прямых
+# соединений), asyncpg по умолчанию всё равно пытается использовать
+# prepared statements — а transaction-режим пулера их не поддерживает
+# (соединение может достаться другому клиенту между запросами одной и той
+# же "сессии"). Результат без этой настройки — случайные ошибки вида
+# "prepared statement ... already exists" под нагрузкой.
+# statement_cache_size=0 отключает кэш подготовленных запросов у asyncpg —
+# рекомендованный официальный обход именно для этого сценария (transaction
+# pooling + asyncpg). Для Neon (прямое соединение, без такого пулера) эта
+# настройка безвредна — просто чуть больше работы на перепланирование
+# запроса на каждый вызов, для типичной веб-нагрузки это не заметно.
+_connect_args["statement_cache_size"] = 0
 
 engine = create_async_engine(
     _url,
