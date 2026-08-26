@@ -57,17 +57,19 @@ async def lifespan(app: FastAPI):
     # так что не страшно, что lifespan выполняется на каждом холодном
     # старте функции (Vercel переиспользует тёплые инстансы между
     # запросами, так что это не на каждый запрос).
-    await bot_app.initialize()
-    await bot_app.start()
-    webhook_url = f"{settings.public_base_url.rstrip('/')}/api/telegram/webhook"
+    bot_started = False
     try:
+        await bot_app.initialize()
+        await bot_app.start()
+        bot_started = True
+
         # Сначала read-only проверка — если вебхук уже указывает на нужный
         # URL, ничего не переотправляем. Без этой проверки КАЖДЫЙ холодный
         # старт функции звал set_webhook заново; если Vercel поднимает
         # несколько инстансов почти одновременно (всплеск трафика/деплой),
         # параллельные set_webhook попадают под flood control Telegram
-        # (429 Too Many Requests). get_webhook_info такому лимиту не
-        # подвержен так жёстко.
+        # (429 Too Many Requests).
+        webhook_url = f"{settings.public_base_url.rstrip('/')}/api/telegram/webhook"
         current = await bot_app.bot.get_webhook_info()
         if current.url != webhook_url:
             await bot_app.bot.set_webhook(
@@ -76,16 +78,22 @@ async def lifespan(app: FastAPI):
                 allowed_updates=Update.ALL_TYPES,
             )
     except Exception as exc:
-        # Если Telegram недоступен на холодном старте (или PUBLIC_BASE_URL
-        # окажется неправильным) — не роняем весь бэкенд из-за этого, просто
-        # логируем. Без этого один сбой set_webhook укладывал 500-кой ВСЕ
-        # роуты API, не только бота.
-        print(f"[bot] не удалось зарегистрировать webhook ({webhook_url}): {exc}")
+        # Бот — best-effort: initialize()/start() сами дёргают Telegram API
+        # (getMe и т.п.), и если Telegram сейчас лимитирует этот бот-токен
+        # (flood control) или временно недоступен — это НЕ должно ронять
+        # весь бэкенд. Остальной API (auth, profile, subjects...) с ботом
+        # никак не связан и обязан продолжать работать. Бот восстановится
+        # сам на следующем холодном старте, когда Telegram отпустит.
+        print(f"[bot] инициализация не удалась, бот будет недоступен до следующего холодного старта: {exc}")
     try:
         yield
     finally:
-        await bot_app.stop()
-        await bot_app.shutdown()
+        if bot_started:
+            try:
+                await bot_app.stop()
+                await bot_app.shutdown()
+            except Exception as exc:
+                print(f"[bot] ошибка при остановке (не критично): {exc}")
 
 
 app = FastAPI(title="Schooler Auth API", lifespan=lifespan)
