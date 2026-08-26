@@ -22,6 +22,18 @@ class Base(DeclarativeBase):
 _LIBPQ_ONLY_PARAMS = ["sslmode", "channel_binding", "target_session_attrs", "options"]
 
 _url = make_url(settings.database_url)
+
+# Провайдеры (Neon, Supabase и т.п.) в своих дашбордах выдают "сырую" строку
+# вида postgresql://... или postgres://... — без +asyncpg, потому что это
+# общий формат для любого клиента (psql, другие языки и т.п.), а не
+# специфика конкретно нашего async-стека. Если просто вставить её как есть в
+# DATABASE_URL, create_async_engine ниже упадёт с ошибкой на этапе импорта
+# db.py — ещё до старта FastAPI, то есть 500 будет вообще на каждый роут.
+# Нормализуем схему сами, чтобы такая (крайне вероятная) человеческая
+# ошибка при копировании строки из панели провайдера не роняла бэкенд.
+if _url.drivername in ("postgres", "postgresql"):
+    _url = _url.set(drivername="postgresql+asyncpg")
+
 _connect_args: dict = {}
 if _url.query.get("sslmode") in ("require", "verify-ca", "verify-full"):
     _connect_args["ssl"] = True
