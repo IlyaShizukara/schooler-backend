@@ -23,6 +23,19 @@ UPSTREAM_HEADERS = {
     "Referer": "https://bank-zadach.ru/",
 }
 
+# Имена файлов на upstream-хранилищах (формулы Wiris, аудио) захэшированы
+# по содержимому — значит один и тот же url физически не может отдать
+# другой контент в будущем. Можно кэшировать агрессивно и без revalidate:
+#   - max-age на стороне браузера — повторные открытия того же задания не
+#     ходят в сеть вообще;
+#   - s-maxage — специально для CDN/edge-кэшей (в т.ч. Vercel Edge Network):
+#     после первого запроса ОТ ЛЮБОГО пользователя ответ оседает на CDN, и
+#     дальше все остальные получают формулу с эджа, даже не долетая до
+#     этой функции и тем более до selstorage.ru.
+# immutable — явная подсказка браузеру не перепроверять файл вообще, пока
+# не истёк max-age (иначе Chrome иногда всё равно шлёт revalidate-запрос).
+CACHE_CONTROL_IMMUTABLE = "public, max-age=31536000, s-maxage=31536000, immutable"
+
 
 @router.get("")
 async def proxy_media(url: str, request: Request):
@@ -47,8 +60,8 @@ async def proxy_media(url: str, request: Request):
         if h in upstream.headers:
             passthrough_headers[h] = upstream.headers[h]
     passthrough_headers.setdefault("accept-ranges", "bytes")
-    passthrough_headers.setdefault("accept-ranges", "bytes")
     passthrough_headers["cross-origin-resource-policy"] = "cross-origin"
+    passthrough_headers["cache-control"] = CACHE_CONTROL_IMMUTABLE
 
     return StreamingResponse(
         iter([upstream.content]),
