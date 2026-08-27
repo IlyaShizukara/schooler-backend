@@ -45,6 +45,13 @@ class Settings(BaseSettings):
     yandex_client_secret: str = ""
     yandex_redirect_uri: str = ""
 
+    # URL JWKS вашего Supabase-проекта — вида
+    # https://<project-ref>.supabase.co/auth/v1/.well-known/jwks.json
+    # Нужен только для входа email+паролем через Supabase Auth
+    # (supabase_auth.py). Пустая строка по умолчанию — чтобы не ломать
+    # запуск бэкенда для тех, кто эту фичу ещё не подключил.
+    supabase_jwks_url: str = ""
+
     @property
     def cors_origins_list(self) -> list[str]:
         value = self.cors_origins.strip()

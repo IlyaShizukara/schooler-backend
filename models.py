@@ -39,6 +39,14 @@ class User(Base):
     )
     vk_id: Mapped[int | None] = mapped_column(BigInteger, unique=True, nullable=True, index=True)
     yandex_id: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True, index=True)
+    # ⚠️ Добавлено для регистрации email+паролем через Supabase Auth (см.
+    # supabase_auth.py). Оба nullable — у Telegram/VK/Яндекс-пользователей
+    # их не будет. telegram_id у email-пользователей — синтетический
+    # отрицательный (см. _new_synthetic_telegram_id в supabase_auth.py),
+    # поэтому вся остальная схема (UserProfile, Attempt, ExamSession и
+    # т.д.), ключующаяся на user_telegram_id, продолжает работать как есть.
+    email: Mapped[str | None] = mapped_column(String(255), unique=True, nullable=True, index=True)
+    supabase_user_id: Mapped[str | None] = mapped_column(String(64), unique=True, nullable=True, index=True)
 
 
 class AuthSession(Base):
