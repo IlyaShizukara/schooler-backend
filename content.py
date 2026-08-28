@@ -4,7 +4,7 @@ import json
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import case, func, select
 
-from auth_dependency import get_current_user
+from auth_dependency import get_current_user, get_current_user_optional
 from db import async_session
 from models import Attempt, ExamSession, Subject, Task, TaskType, Topic, User
 from schemas import (
@@ -111,11 +111,15 @@ def _display_correct_answer(raw: str | None) -> str | None:
 
 
 async def _load_all_subject_stats(
-    session, user_telegram_id: int
+    session, user_telegram_id: int | None
 ) -> tuple[list[Subject], dict[int, SubjectOut]]:
     """Считает статистику по ВСЕМ предметам за 3 запроса вместо 4 запросов
     на каждый предмет по отдельности (было 44 запроса на 11 предметов —
-    самая частая причина «долго грузит» при росте банка заданий)."""
+    самая частая причина «долго грузит» при росте банка заданий).
+
+    user_telegram_id=None (гость): пропускаем запросы по Attempt целиком —
+    у гостя прогресса нет по определению (не сохраняем), нет смысла даже
+    ходить в БД за solved/accuracy — сразу отдаём банк заданий с нулями."""
     subjects = (await session.execute(select(Subject).order_by(Subject.id))).scalars().all()
 
     totals = dict(
@@ -124,36 +128,40 @@ async def _load_all_subject_stats(
         )).all()
     )
 
-    solved = dict(
-        (await session.execute(
-            select(Task.subject_id, func.count(func.distinct(Attempt.task_id)))
-            .select_from(Attempt)
-            .join(Task, Task.id == Attempt.task_id)
-            .where(Attempt.user_telegram_id == user_telegram_id)
-            .group_by(Task.subject_id)
-        )).all()
-    )
-
-    attempts_raw = (
-        await session.execute(
-            select(
-                Task.subject_id,
-                func.count(Attempt.id),
-                func.sum(case((Attempt.is_correct.is_(True), 1), else_=0)),
-            )
-            .select_from(Attempt)
-            .join(Task, Task.id == Attempt.task_id)
-            .where(Attempt.user_telegram_id == user_telegram_id)
-            .group_by(Task.subject_id)
-        )
-    ).all()
-    attempts = {row[0]: (row[1], row[2] or 0) for row in attempts_raw}
-
     total_points_by_subject = dict(
         (await session.execute(
             select(Task.subject_id, func.sum(Task.points)).group_by(Task.subject_id)
         )).all()
     )
+
+    if user_telegram_id is None:
+        solved: dict[int, int] = {}
+        attempts: dict[int, tuple[int, int]] = {}
+    else:
+        solved = dict(
+            (await session.execute(
+                select(Task.subject_id, func.count(func.distinct(Attempt.task_id)))
+                .select_from(Attempt)
+                .join(Task, Task.id == Attempt.task_id)
+                .where(Attempt.user_telegram_id == user_telegram_id)
+                .group_by(Task.subject_id)
+            )).all()
+        )
+
+        attempts_raw = (
+            await session.execute(
+                select(
+                    Task.subject_id,
+                    func.count(Attempt.id),
+                    func.sum(case((Attempt.is_correct.is_(True), 1), else_=0)),
+                )
+                .select_from(Attempt)
+                .join(Task, Task.id == Attempt.task_id)
+                .where(Attempt.user_telegram_id == user_telegram_id)
+                .group_by(Task.subject_id)
+            )
+        ).all()
+        attempts = {row[0]: (row[1], row[2] or 0) for row in attempts_raw}
 
     stats: dict[int, SubjectOut] = {}
     for s in subjects:
@@ -171,15 +179,15 @@ async def _load_all_subject_stats(
     return subjects, stats
 
 
-@router.get("/subjects", response_model=list[SubjectOut])
-async def list_subjects(user: User = Depends(get_current_user)) -> list[SubjectOut]:
+@router.get("/subjects", response_model=list[SubjectOut], dependencies=[Depends(rate_limit(60, 60))])
+async def list_subjects(user: User | None = Depends(get_current_user_optional)) -> list[SubjectOut]:
     async with async_session() as session:
-        subjects, stats = await _load_all_subject_stats(session, user.telegram_id)
+        subjects, stats = await _load_all_subject_stats(session, user.telegram_id if user else None)
         return [stats[s.id] for s in subjects]
 
 
-@router.get("/subjects/{slug}/topics", response_model=list[TopicOut])
-async def list_topics(slug: str, user: User = Depends(get_current_user)) -> list[TopicOut]:
+@router.get("/subjects/{slug}/topics", response_model=list[TopicOut], dependencies=[Depends(rate_limit(60, 60))])
+async def list_topics(slug: str, user: User | None = Depends(get_current_user_optional)) -> list[TopicOut]:
     async with async_session() as session:
         subject = (
             await session.execute(select(Subject).where(Subject.slug == slug))
@@ -205,31 +213,6 @@ async def list_topics(slug: str, user: User = Depends(get_current_user)) -> list
             )).all()
         )
 
-        solved = dict(
-            (await session.execute(
-                select(Task.topic_id, func.count(func.distinct(Attempt.task_id)))
-                .select_from(Attempt)
-                .join(Task, Task.id == Attempt.task_id)
-                .where(Task.subject_id == subject.id, Attempt.user_telegram_id == user.telegram_id)
-                .group_by(Task.topic_id)
-            )).all()
-        )
-
-        attempts_raw = (
-            await session.execute(
-                select(
-                    Task.topic_id,
-                    func.count(Attempt.id),
-                    func.sum(case((Attempt.is_correct.is_(True), 1), else_=0)),
-                )
-                .select_from(Attempt)
-                .join(Task, Task.id == Attempt.task_id)
-                .where(Task.subject_id == subject.id, Attempt.user_telegram_id == user.telegram_id)
-                .group_by(Task.topic_id)
-            )
-        ).all()
-        attempts = {row[0]: (row[1], row[2] or 0) for row in attempts_raw}
-
         points_by_topic = dict(
             (await session.execute(
                 select(Task.topic_id, func.sum(Task.points))
@@ -237,6 +220,37 @@ async def list_topics(slug: str, user: User = Depends(get_current_user)) -> list
                 .group_by(Task.topic_id)
             )).all()
         )
+
+        if user is None:
+            # Гость: без персонализации, аналогично _load_all_subject_stats —
+            # не ходим в Attempt вообще.
+            solved: dict[int | None, int] = {}
+            attempts: dict[int | None, tuple[int, int]] = {}
+        else:
+            solved = dict(
+                (await session.execute(
+                    select(Task.topic_id, func.count(func.distinct(Attempt.task_id)))
+                    .select_from(Attempt)
+                    .join(Task, Task.id == Attempt.task_id)
+                    .where(Task.subject_id == subject.id, Attempt.user_telegram_id == user.telegram_id)
+                    .group_by(Task.topic_id)
+                )).all()
+            )
+
+            attempts_raw = (
+                await session.execute(
+                    select(
+                        Task.topic_id,
+                        func.count(Attempt.id),
+                        func.sum(case((Attempt.is_correct.is_(True), 1), else_=0)),
+                    )
+                    .select_from(Attempt)
+                    .join(Task, Task.id == Attempt.task_id)
+                    .where(Task.subject_id == subject.id, Attempt.user_telegram_id == user.telegram_id)
+                    .group_by(Task.topic_id)
+                )
+            ).all()
+            attempts = {row[0]: (row[1], row[2] or 0) for row in attempts_raw}
 
         def build_topic_out(
             topic_id: int | None, name: str, difficulty: str | None = None,
@@ -259,11 +273,11 @@ async def list_topics(slug: str, user: User = Depends(get_current_user)) -> list
         return result
 
 
-@router.get("/subjects/{slug}/next-task", response_model=TaskOut)
+@router.get("/subjects/{slug}/next-task", response_model=TaskOut, dependencies=[Depends(rate_limit(60, 60))])
 async def next_task(
     slug: str,
     topic_id: int | None = Query(default=None, description="Фильтр по теме; -1 = задания без темы"),
-    user: User = Depends(get_current_user),
+    user: User | None = Depends(get_current_user_optional),
 ) -> TaskOut:
     async with async_session() as session:
         subject = (
@@ -276,22 +290,26 @@ async def next_task(
         if topic_id is not None:
             filters.append(Task.topic_id.is_(None) if topic_id == -1 else Task.topic_id == topic_id)
 
-        # Сначала пробуем найти задание, которое пользователь ещё не решал.
-        answered_ids_subq = (
-            select(Attempt.task_id)
-            .where(Attempt.user_telegram_id == user.telegram_id)
-            .scalar_subquery()
-        )
-        task = (
-            await session.execute(
-                select(Task)
-                .where(*filters, Task.id.not_in(answered_ids_subq))
-                .order_by(func.random())
-                .limit(1)
+        # Сначала пробуем найти задание, которое пользователь ещё не решал —
+        # у гостя истории попыток по определению нет, поэтому для него сразу
+        # переходим к случайному выбору без вычитания "уже решённых".
+        task = None
+        if user is not None:
+            answered_ids_subq = (
+                select(Attempt.task_id)
+                .where(Attempt.user_telegram_id == user.telegram_id)
+                .scalar_subquery()
             )
-        ).scalar_one_or_none()
+            task = (
+                await session.execute(
+                    select(Task)
+                    .where(*filters, Task.id.not_in(answered_ids_subq))
+                    .order_by(func.random())
+                    .limit(1)
+                )
+            ).scalar_one_or_none()
 
-        # Если нерешённых не осталось — даём случайное задание повторно.
+        # Если нерешённых не осталось (или это гость) — даём случайное задание.
         if task is None:
             task = (
                 await session.execute(
@@ -311,7 +329,8 @@ async def next_task(
         # смысла — сразу отдаём эталон/критерии вместе с заданием, фронтенд
         # покажет их по кнопке "Показать ответ" без отправки на /answer.
         # Для части 1 оба поля остаются None — ответ раскрывается только
-        # после POST /tasks/{id}/answer, как и раньше.
+        # после POST /tasks/{id}/answer, как и раньше. Это поведение не
+        # зависит от того, гость это или залогиненный пользователь.
         reveal_answer = task.part == 2
         return TaskOut(
             id=task.id,
@@ -335,7 +354,7 @@ DOUBLE_SUBMIT_WINDOW_SECONDS = 5
 
 @router.post("/tasks/{task_id}/answer", response_model=AnswerOut, dependencies=[Depends(rate_limit(20, 60))])
 async def submit_answer(
-    task_id: int, payload: AnswerIn, user: User = Depends(get_current_user)
+    task_id: int, payload: AnswerIn, user: User | None = Depends(get_current_user_optional)
 ) -> AnswerOut:
     async with async_session() as session:
         task = await session.get(Task, task_id)
@@ -348,45 +367,44 @@ async def submit_answer(
                 detail="Задания части 2 не проверяются автоматически — эталон уже показан вместе с заданием",
             )
 
-        # Защита от двойного клика: вне пробника один и тот же task_id можно
-        # решать повторно (next-task может выдать его снова, спустя время) —
-        # поэтому нельзя просто запретить повтор навсегда по (user, task_id).
-        # Вместо этого — короткое окно: если та же попытка уже была сохранена
-        # буквально пару секунд назад, считаем это дублем клика и просто
-        # отдаём тот же результат, не создавая вторую запись и не начисляя XP
-        # повторно.
-        recent_attempt = (
-            await session.execute(
-                select(Attempt)
-                .where(
-                    Attempt.user_telegram_id == user.telegram_id,
-                    Attempt.task_id == task.id,
-                    Attempt.exam_session_id.is_(None),
+        # Защита от двойного клика имеет смысл только там, где есть история
+        # попыток в БД — у гостя её нет и не будет, пропускаем эту проверку.
+        if user is not None:
+            recent_attempt = (
+                await session.execute(
+                    select(Attempt)
+                    .where(
+                        Attempt.user_telegram_id == user.telegram_id,
+                        Attempt.task_id == task.id,
+                        Attempt.exam_session_id.is_(None),
+                    )
+                    .order_by(Attempt.answered_at.desc())
+                    .limit(1)
                 )
-                .order_by(Attempt.answered_at.desc())
-                .limit(1)
-            )
-        ).scalar_one_or_none()
-        if recent_attempt is not None:
-            age_seconds = (dt.datetime.now(dt.timezone.utc) - recent_attempt.answered_at).total_seconds()
-            if age_seconds < DOUBLE_SUBMIT_WINDOW_SECONDS:
-                return AnswerOut(
-                    is_correct=recent_attempt.is_correct,
-                    correct_index=task.correct_index,
-                    correct_answer_text=_display_correct_answer(task.correct_answer_text),
-                    explanation=task.explanation,
-                )
+            ).scalar_one_or_none()
+            if recent_attempt is not None:
+                age_seconds = (dt.datetime.now(dt.timezone.utc) - recent_attempt.answered_at).total_seconds()
+                if age_seconds < DOUBLE_SUBMIT_WINDOW_SECONDS:
+                    return AnswerOut(
+                        is_correct=recent_attempt.is_correct,
+                        correct_index=task.correct_index,
+                        correct_answer_text=_display_correct_answer(task.correct_answer_text),
+                        explanation=task.explanation,
+                    )
 
         if task.task_type == TaskType.short_answer:
             is_correct = _answer_matches(payload.answer_text, task.correct_answer_text)
         else:
             is_correct = payload.selected_index == task.correct_index
 
-        session.add(
-            Attempt(user_telegram_id=user.telegram_id, task_id=task.id, is_correct=is_correct)
-        )
-        await award_xp(session, user.telegram_id, XP_CORRECT if is_correct else XP_INCORRECT)
-        await session.commit()
+        # Гость: результат считаем и отдаём как есть, но НИЧЕГО не пишем в
+        # БД — ни Attempt, ни XP. Это и есть "без сохранения прогресса".
+        if user is not None:
+            session.add(
+                Attempt(user_telegram_id=user.telegram_id, task_id=task.id, is_correct=is_correct)
+            )
+            await award_xp(session, user.telegram_id, XP_CORRECT if is_correct else XP_INCORRECT)
+            await session.commit()
 
         return AnswerOut(
             is_correct=is_correct,

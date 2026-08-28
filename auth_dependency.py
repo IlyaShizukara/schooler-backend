@@ -38,3 +38,35 @@ async def get_current_user(authorization: str = Header(...)) -> User:
             raise HTTPException(status_code=401, detail="Пользователь не найден")
 
         return user
+
+
+async def get_current_user_optional(authorization: str | None = Header(default=None)) -> User | None:
+    """Как get_current_user, но для эндпоинтов, которые должны отдавать
+    контент и гостю: при отсутствии заголовка, невалидном или истёкшем
+    токене просто возвращает None вместо 401 — роут сам решает, что
+    показать неавторизованному (обычно — тот же контент без персонализации,
+    без записи Attempt/XP).
+
+    ⚠️ Не путать с get_current_user: для действий, которые обязаны быть
+    привязаны к пользователю (профиль, XP, история пробников), используем
+    строгую версию — эта только для честно-гостевых сценариев.
+    """
+    if not authorization or not authorization.startswith("Bearer "):
+        return None
+
+    token = authorization.removeprefix("Bearer ").strip()
+    if not token:
+        return None
+
+    async with async_session() as session:
+        user_session = await session.get(UserSession, token)
+        if user_session is None or user_session.revoked:
+            return None
+
+        if user_session.expires_at < dt.datetime.now(dt.timezone.utc):
+            return None
+
+        result = await session.execute(
+            select(User).where(User.telegram_id == user_session.user_telegram_id)
+        )
+        return result.scalar_one_or_none()

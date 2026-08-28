@@ -1,6 +1,7 @@
 import datetime as dt
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 from sqlalchemy import func, select
 
 from auth_dependency import get_current_user
@@ -46,6 +47,54 @@ EXAM_STRUCTURE = {
 router = APIRouter(prefix="/api/probnik", tags=["probnik"])
 
 
+async def _select_probnik_tasks(session, subject: Subject, payload: ProbnikStartIn) -> list[Task]:
+    """Выбирает набор заданий пробника по предмету/теме/частям — вынесено из
+    start_probnik в отдельную функцию, чтобы использовать тот же алгоритм
+    подбора и для гостевого /guest/start (без создания ExamSession).
+    Поведение НЕ изменилось, просто перестало быть телом одного роута."""
+    tasks: list[Task] = []
+
+    if payload.topic_id is not None:
+        limit = payload.task_count or 10
+        tasks = (
+            await session.execute(
+                select(Task)
+                .where(Task.subject_id == subject.id, Task.topic_id == payload.topic_id)
+                .order_by(func.random())
+                .limit(limit)
+            )
+        ).scalars().all()
+    else:
+        structure = EXAM_STRUCTURE.get(payload.subject_slug)
+        selected_parts = set(payload.parts or [])
+        want_part1 = not selected_parts or "Часть 1" in selected_parts
+        want_part2 = not selected_parts or "Часть 2" in selected_parts
+
+        if want_part1:
+            q1 = (
+                select(Task)
+                .where(Task.subject_id == subject.id, Task.part == 1)
+                .distinct(Task.task_number)
+                .order_by(Task.task_number, func.random())
+            )
+            if structure:
+                q1 = q1.limit(structure["part1"])
+            tasks.extend((await session.execute(q1)).scalars().all())
+
+        if want_part2:
+            q2 = (
+                select(Task)
+                .where(Task.subject_id == subject.id, Task.part == 2)
+                .distinct(Task.task_number)
+                .order_by(Task.task_number, func.random())
+            )
+            if structure:
+                q2 = q2.limit(structure["part2"])
+            tasks.extend((await session.execute(q2)).scalars().all())
+
+    return tasks
+
+
 @router.post("/start", response_model=ProbnikStartOut, dependencies=[Depends(rate_limit(10, 60))])
 async def start_probnik(payload: ProbnikStartIn, user: User = Depends(get_current_user)) -> ProbnikStartOut:
     async with async_session() as session:
@@ -55,45 +104,7 @@ async def start_probnik(payload: ProbnikStartIn, user: User = Depends(get_curren
         if subject is None:
             raise HTTPException(status_code=404, detail="Предмет не найден")
 
-        tasks: list[Task] = []
-
-        if payload.topic_id is not None:
-            limit = payload.task_count or 10
-            tasks = (
-                await session.execute(
-                    select(Task)
-                    .where(Task.subject_id == subject.id, Task.topic_id == payload.topic_id)
-                    .order_by(func.random())
-                    .limit(limit)
-                )
-            ).scalars().all()
-        else:
-            structure = EXAM_STRUCTURE.get(payload.subject_slug)
-            selected_parts = set(payload.parts or [])
-            want_part1 = not selected_parts or "Часть 1" in selected_parts
-            want_part2 = not selected_parts or "Часть 2" in selected_parts
-
-            if want_part1:
-                q1 = (
-                    select(Task)
-                    .where(Task.subject_id == subject.id, Task.part == 1)
-                    .distinct(Task.task_number)
-                    .order_by(Task.task_number, func.random())
-                )
-                if structure:
-                    q1 = q1.limit(structure["part1"])
-                tasks.extend((await session.execute(q1)).scalars().all())
-
-            if want_part2:
-                q2 = (
-                    select(Task)
-                    .where(Task.subject_id == subject.id, Task.part == 2)
-                    .distinct(Task.task_number)
-                    .order_by(Task.task_number, func.random())
-                )
-                if structure:
-                    q2 = q2.limit(structure["part2"])
-                tasks.extend((await session.execute(q2)).scalars().all())
+        tasks = await _select_probnik_tasks(session, subject, payload)
 
         if not tasks:
             raise HTTPException(status_code=404, detail="Для этого предмета пока нет заданий")
@@ -135,6 +146,179 @@ async def start_probnik(payload: ProbnikStartIn, user: User = Depends(get_curren
                 for t in tasks
             ],
             total_points=sum(t.points for t in gradable_tasks),
+        )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Гостевой пробник — полностью без БД (ни ExamSession, ни Attempt, ни XP).
+# Два запроса вместо пяти: /guest/start отдаёт задания (как обычный /start,
+# но без session_id — писать некуда, ExamSession.user_telegram_id обязателен
+# везде в проекте), /guest/grade принимает ВСЕ ответы одним пакетом и сразу
+# считает итог в памяти. Часть 2 не проверяется автоматически даже у
+# залогиненных (self-grade), а без сохранённой сессии самооценку тоже
+# сохранять некуда — поэтому для гостя часть 2 только показывается для
+# самопроверки (эталон/критерии), но не учитывается в баллах. Официальный
+# вторичный балл в таком виде был бы вводящим в заблуждение (считается по
+# полному экзамену), поэтому для гостя мы его не считаем вовсе — честно,
+# как и договаривались по правилам проекта.
+# ──────────────────────────────────────────────────────────────────────────
+
+class ProbnikGuestStartOut(BaseModel):
+    subject_slug: str
+    subject_name: str
+    tasks: list[TaskOut]
+    total_points: int
+
+
+class ProbnikGuestAnswerIn(BaseModel):
+    task_id: int
+    selected_index: int | None = None
+    answer_text: str | None = None
+
+
+class ProbnikGuestGradeIn(BaseModel):
+    subject_slug: str
+    answers: list[ProbnikGuestAnswerIn]
+
+
+class ProbnikGuestGradeOut(BaseModel):
+    subject_name: str
+    tasks: list[ProbnikReviewTaskOut]
+    total_points: int
+    earned_points: int
+    percent: int
+    note: str
+
+
+@router.post("/guest/start", response_model=ProbnikGuestStartOut, dependencies=[Depends(rate_limit(10, 60))])
+async def start_probnik_guest(payload: ProbnikStartIn) -> ProbnikGuestStartOut:
+    async with async_session() as session:
+        subject = (
+            await session.execute(select(Subject).where(Subject.slug == payload.subject_slug))
+        ).scalar_one_or_none()
+        if subject is None:
+            raise HTTPException(status_code=404, detail="Предмет не найден")
+
+        tasks = await _select_probnik_tasks(session, subject, payload)
+        if not tasks:
+            raise HTTPException(status_code=404, detail="Для этого предмета пока нет заданий")
+
+        gradable_tasks = [t for t in tasks if t.part == 1]
+
+        # Ничего не пишем в БД — просто отдаём набор заданий. Фронтенд сам
+        # хранит ответы гостя (в памяти/state), пока тот проходит пробник,
+        # и в конце отправляет их все разом на /guest/grade.
+        return ProbnikGuestStartOut(
+            subject_slug=subject.slug,
+            subject_name=subject.name,
+            tasks=[
+                TaskOut(
+                    id=t.id, subject_slug=subject.slug, topic=None,
+                    task_type=t.task_type.value, part=t.part,
+                    task_number=t.task_number,
+                    question=t.question, options=t.options, points=t.points,
+                    image_urls=t.image_urls,
+                    file_urls=t.file_urls,
+                    correct_answer_text=None,
+                    explanation=None,
+                )
+                for t in tasks
+            ],
+            total_points=sum(t.points for t in gradable_tasks),
+        )
+
+
+@router.post("/guest/grade", response_model=ProbnikGuestGradeOut, dependencies=[Depends(rate_limit(10, 60))])
+async def grade_probnik_guest(payload: ProbnikGuestGradeIn) -> ProbnikGuestGradeOut:
+    async with async_session() as session:
+        subject = (
+            await session.execute(select(Subject).where(Subject.slug == payload.subject_slug))
+        ).scalar_one_or_none()
+        if subject is None:
+            raise HTTPException(status_code=404, detail="Предмет не найден")
+
+        task_ids = [a.task_id for a in payload.answers]
+        if not task_ids:
+            raise HTTPException(status_code=400, detail="Пустой список ответов")
+
+        tasks_by_id = {
+            t.id: t
+            for t in (
+                await session.execute(
+                    select(Task).where(Task.id.in_(task_ids), Task.subject_id == subject.id)
+                )
+            ).scalars().all()
+        }
+
+        review_tasks: list[ProbnikReviewTaskOut] = []
+        total_points = 0
+        earned_points = 0
+
+        for answer in payload.answers:
+            task = tasks_by_id.get(answer.task_id)
+            if task is None:
+                # Задание не найдено или не относится к предмету — пропускаем,
+                # не роняя весь пробник из-за одного плохого id.
+                continue
+
+            total_points += task.points
+
+            if task.part == 1:
+                if task.task_type == TaskType.short_answer:
+                    is_correct = _answer_matches(answer.answer_text, task.correct_answer_text)
+                else:
+                    is_correct = answer.selected_index == task.correct_index
+                if is_correct:
+                    earned_points += task.points
+
+                review_tasks.append(
+                    ProbnikReviewTaskOut(
+                        id=task.id, task_type=task.task_type.value, part=task.part,
+                        task_number=task.task_number, question=task.question,
+                        options=task.options, image_urls=task.image_urls, file_urls=task.file_urls,
+                        points=task.points,
+                        selected_index=answer.selected_index,
+                        answer_text=answer.answer_text,
+                        answered=True,
+                        is_correct=is_correct,
+                        correct_index=task.correct_index,
+                        correct_answer_text=_display_correct_answer(task.correct_answer_text),
+                        explanation=task.explanation,
+                    )
+                )
+            else:
+                # Часть 2 — как и у залогиненных, автоматически не проверяется.
+                # Показываем эталон/критерии для самопроверки, но НЕ добавляем
+                # в earned_points — без сохранённой сессии самооценку сохранить
+                # негде, а угадывать баллы за гостя нечестно (см. правило
+                # проекта "либо реальные данные, либо честная пометка").
+                review_tasks.append(
+                    ProbnikReviewTaskOut(
+                        id=task.id, task_type=task.task_type.value, part=task.part,
+                        task_number=task.task_number, question=task.question,
+                        options=task.options, image_urls=task.image_urls, file_urls=task.file_urls,
+                        points=task.points,
+                        correct_answer_text=_display_correct_answer(task.correct_answer_text),
+                        explanation=task.explanation,
+                        criteria=task.criteria,
+                    )
+                )
+
+        percent = round(earned_points / total_points * 100) if total_points else 0
+
+        return ProbnikGuestGradeOut(
+            subject_name=subject.name,
+            tasks=review_tasks,
+            total_points=total_points,
+            earned_points=earned_points,
+            percent=percent,
+            note=(
+                "Результат посчитан только по части 1 и нигде не сохранён — как гость, ты не теряешь "
+                "к нему доступ, но и продолжить позже не сможешь. Часть 2 показана для самопроверки, "
+                "но не учтена в баллах: официальный вторичный балл считается по всему экзамену. "
+                "Войди через Telegram, чтобы получить баллы по обеим частям, официальный вторичный балл "
+                "и сохранённую историю пробников."
+            ),
         )
 
 
