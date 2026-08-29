@@ -261,9 +261,13 @@ async def grade_probnik_guest(payload: ProbnikGuestGradeIn) -> ProbnikGuestGrade
                 # не роняя весь пробник из-за одного плохого id.
                 continue
 
-            total_points += task.points
-
             if task.part == 1:
+                # total_points считаем ТОЛЬКО по части 1 — она единственная,
+                # что реально оценивается. Раньше сюда попадали и баллы части
+                # 2 (просто никогда не засчитывались в earned_points), из-за
+                # чего процент был заниженным даже при идеальной части 1:
+                # общий знаменатель включал недостижимые для гостя баллы.
+                total_points += task.points
                 if task.task_type == TaskType.short_answer:
                     is_correct = _answer_matches(answer.answer_text, task.correct_answer_text)
                 else:
