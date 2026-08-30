@@ -39,7 +39,7 @@ from pydantic import BaseModel
 from vk_auth import router as vk_auth_router
 from yandex_auth import router as yandex_auth_router
 from supabase_auth import router as supabase_auth_router
-from ai_tutor import router as ai_tutor
+from ai_tutor import router as ai_tutor_router
 
 bot_app = build_bot_application()
 
@@ -124,7 +124,7 @@ app.include_router(media_proxy_router)
 app.include_router(vk_auth_router)
 app.include_router(yandex_auth_router)
 app.include_router(supabase_auth_router)
-app.include_router(ai_tutor.router)
+app.include_router(ai_tutor_router)
 
 # ⚠️ ВАЖНО ПЕРЕД ПЕРЕЕЗДОМ НА VERCEL: serverless-функции не имеют
 # постоянной файловой системы между запросами/инстансами — всё, что
