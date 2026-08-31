@@ -24,8 +24,8 @@ router = APIRouter(prefix="/api/ai", tags=["ai-tutor"])
 
 # Инициализация клиента YandexGPT через OpenAI-совместимый эндпоинт
 _client = AsyncOpenAI(
-    base_url="https://ai.api.cloud.yandex.net/v1",
-    api_key=os.environ["YANDEX_API_KEY"],  # ключ из Yandex AI Studio
+    base_url="https://api.aistudio.yandex.ru/v1/",
+    api_key=os.environ["YANDEX_API_KEY"],
 )
 
 # Используй "yandexgpt" или "yandexgpt-lite" (быстрее и дешевле)
