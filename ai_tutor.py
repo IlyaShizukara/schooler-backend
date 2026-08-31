@@ -1,11 +1,6 @@
 """
-ИИ-репетитор. Два режима в одном эндпоинте:
-  - task_id передан → объяснение конкретного задания/ошибки. Модель обязана
-    объяснять СТРОГО по материалу задания, не придумывая других чисел или фактов.
-  - task_id не передан → свободный чат по темам подготовки к экзаменам.
-
-Модель — YandexGPT через OpenAI-совместимый API Yandex AI Studio.
-Используется API-ключ, который не истекает.
+ИИ-репетитор. Использует OpenRouter для доступа к YandexGPT.
+Без folder_id, без проблем с подключением.
 """
 import os
 from collections.abc import AsyncIterator
@@ -22,14 +17,18 @@ from rate_limit import rate_limit
 
 router = APIRouter(prefix="/api/ai", tags=["ai-tutor"])
 
-# Инициализация клиента YandexGPT через OpenAI-совместимый эндпоинт
+# OpenRouter клиент
 _client = AsyncOpenAI(
-    base_url="https://llm.api.cloud.yandex.net/v1",
-    api_key=os.environ["YANDEX_API_KEY"],
+    base_url="https://openrouter.ai/api/v1",
+    api_key=os.environ["OPENROUTER_API_KEY"],
+    default_headers={
+        "HTTP-Referer": "https://myschooler.ru",  # замени на свой сайт
+        "X-OpenRouter-Title": "Schooler AI Tutor",
+    }
 )
 
-# Используй "yandexgpt" или "yandexgpt-lite" (быстрее и дешевле)
-MODEL = os.environ.get("YANDEX_MODEL", "yandexgpt")
+# Модель YandexGPT через OpenRouter
+MODEL = "yandex/yandexgpt"  # или "yandex/yandexgpt-lite"
 MAX_TOKENS = 1024
 MAX_HISTORY_MESSAGES = 20
 
@@ -57,16 +56,13 @@ class ChatIn(BaseModel):
 
 
 async def _build_task_context(task_id: int) -> str | None:
-    """Собирает текстовое описание задания для подмешивания в промпт."""
     async with async_session() as session:
         task = await session.get(Task, task_id)
         if task is None:
             return None
-
         lines = [f"Вопрос: {task.question}"]
         if task.options:
             lines.append("Варианты ответа: " + "; ".join(task.options))
-
         if task.part == 1:
             if task.correct_index is not None and task.options:
                 lines.append(f"Правильный вариант: {task.options[task.correct_index]}")
@@ -77,10 +73,8 @@ async def _build_task_context(task_id: int) -> str | None:
                 lines.append(f"Эталонный ответ/решение: {task.correct_answer_text}")
             if task.criteria:
                 lines.append(f"Критерии оценивания: {task.criteria}")
-
         if task.explanation:
             lines.append(f"Пояснение: {task.explanation}")
-
         return "\n".join(lines)
 
 
@@ -88,7 +82,6 @@ async def _build_task_context(task_id: int) -> str | None:
 async def chat(payload: ChatIn, user: User = Depends(get_current_user)) -> StreamingResponse:
     messages = [m.model_dump() for m in payload.messages[-MAX_HISTORY_MESSAGES:]]
 
-    # Подмешиваем материал задания, если передан task_id
     if payload.task_id is not None:
         context = await _build_task_context(payload.task_id)
         if context is None:
@@ -101,7 +94,6 @@ async def chat(payload: ChatIn, user: User = Depends(get_current_user)) -> Strea
                 "content": f"Материал задания:\n{context}\n\nВопрос ученика: {original}",
             }
 
-    # Преобразуем историю в формат для OpenAI
     openai_messages = [
         {"role": "system", "content": TUTOR_SYSTEM_PROMPT},
         *[{"role": m["role"], "content": m["content"]} for m in messages],
@@ -114,7 +106,7 @@ async def chat(payload: ChatIn, user: User = Depends(get_current_user)) -> Strea
                 messages=openai_messages,
                 temperature=0.7,
                 max_tokens=MAX_TOKENS,
-                stream=True,  # включаем стриминг
+                stream=True,
             )
             async for chunk in stream:
                 content = chunk.choices[0].delta.content
