@@ -28,7 +28,7 @@ _client = AsyncOpenAI(
 )
 
 # Модель YandexGPT через OpenRouter
-MODEL = "deepseek/deepseek-chat:free"
+MODEL = "deepseek/deepseek-chat"
 MAX_TOKENS = 1024
 MAX_HISTORY_MESSAGES = 20
 
