@@ -36,6 +36,19 @@ UPSTREAM_HEADERS = {
 # не истёк max-age (иначе Chrome иногда всё равно шлёт revalidate-запрос).
 CACHE_CONTROL_IMMUTABLE = "public, max-age=31536000, s-maxage=31536000, immutable"
 
+# Один общий клиент на весь "тёплый" инстанс функции вместо нового
+# httpx.AsyncClient() на каждый запрос. `async with httpx.AsyncClient()`
+# на каждый вызов означало новый TCP+TLS хендшейк до selstorage.ru/
+# bank-zadach.ru/kompege.ru на КАЖДУЮ картинку и КАЖДЫЙ аудиофайл — на
+# странице с десятком формул это десяток лишних хендшейков подряд.
+# Общий клиент держит keep-alive соединения к upstream-хостам между
+# запросами (как engine в db.py держит пул к базе), так что повторные
+# запросы к тому же хосту переиспользуют уже открытое соединение.
+_client = httpx.AsyncClient(
+    timeout=30.0,
+    limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
+)
+
 
 @router.get("")
 async def proxy_media(url: str, request: Request):
@@ -49,10 +62,21 @@ async def proxy_media(url: str, request: Request):
     if range_header:
         headers["Range"] = range_header
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        upstream = await client.get(url, headers=headers)
+    # stream=True + aiter_bytes ниже: раньше `client.get()` ждал, пока
+    # скачается ВЕСЬ файл (например, весь mp3), и только потом начинал
+    # отдавать его клиенту одним куском (`iter([upstream.content])`) — это
+    # добавляло к времени ответа полное время скачивания с upstream ещё до
+    # первого байта пользователю. Теперь первые байты уходят клиенту сразу
+    # по мере поступления от upstream, а не после полной загрузки файла на
+    # сервере.
+    req = _client.build_request("GET", url, headers=headers)
+    try:
+        upstream = await _client.send(req, stream=True)
+    except httpx.HTTPError:
+        raise HTTPException(status_code=502, detail="Не удалось получить медиафайл")
 
     if upstream.status_code >= 400:
+        await upstream.aclose()
         raise HTTPException(status_code=502, detail="Не удалось получить медиафайл")
 
     passthrough_headers = {}
@@ -63,8 +87,15 @@ async def proxy_media(url: str, request: Request):
     passthrough_headers["cross-origin-resource-policy"] = "cross-origin"
     passthrough_headers["cache-control"] = CACHE_CONTROL_IMMUTABLE
 
+    async def body():
+        try:
+            async for chunk in upstream.aiter_bytes():
+                yield chunk
+        finally:
+            await upstream.aclose()
+
     return StreamingResponse(
-        iter([upstream.content]),
+        body(),
         status_code=upstream.status_code,
         headers=passthrough_headers,
     )

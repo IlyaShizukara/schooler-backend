@@ -60,8 +60,23 @@ _connect_args["statement_cache_size"] = 0
 engine = create_async_engine(
     _url,
     echo=False,
-    pool_pre_ping=True,   # проверяет соединение "living-ness" перед выдачей из пула
-    pool_recycle=1800,    # пересоздаёт соединения раз в 30 мин, чтобы не протухали
+    # pool_pre_ping тут НЕ включаем: с прямым подключением он был страховкой
+    # от протухших TCP-соединений, но с транзакционным пулером Supabase
+    # (Supavisor, порт 6543) каждое "соединение" из пула и так свежее —
+    # пулер сам управляет реальными соединениями к базе за кулисами.
+    # pre_ping в этой конфигурации — чистый лишний round-trip (SELECT 1)
+    # перед каждым настоящим запросом.
+    #
+    # По той же причине не выставляем pool_recycle: жизнью соединений
+    # к самой базе занимается Supavisor на своей стороне.
+    #
+    # pool_size/max_overflow — на serverless держим по одному соединению на
+    # инстанс функции: внутри одного вызова нет настоящего параллелизма по
+    # БД (await блокирует), а большой пул на инстанс только зря резервирует
+    # соединения в Supavisor, которых на transaction-пулер и так лимитировано
+    # количество на проект.
+    pool_size=1,
+    max_overflow=0,
     connect_args=_connect_args,
 )
 async_session = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
