@@ -1,7 +1,7 @@
 import datetime as dt
 import json
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy import case, func, select
 
 from auth_dependency import get_current_user, get_current_user_optional
@@ -183,14 +183,29 @@ async def _load_all_subject_stats(
 
 
 @router.get("/subjects", response_model=list[SubjectOut], dependencies=[Depends(rate_limit(60, 60))])
-async def list_subjects(user: User | None = Depends(get_current_user_optional)) -> list[SubjectOut]:
+async def list_subjects(response: Response, user: User | None = Depends(get_current_user_optional)) -> list[SubjectOut]:
     async with async_session() as session:
         subjects, stats = await _load_all_subject_stats(session, user.telegram_id if user else None)
+
+        # Гостевой ответ (нет Authorization-заголовка) одинаков для ВСЕХ
+        # гостей — solved=0/accuracy=0 по всем предметам гарантирует бэкенд
+        # (см. _load_all_subject_stats: user_telegram_id=None). Такой ответ
+        # безопасно кэшировать на CDN (Vercel Edge Network): следующий гость
+        # получит список предметов с эджа, вообще не доходя до этой функции
+        # и тем более до БД. s-maxage — именно для CDN; обычный max-age —
+        # для браузера. Авторизованный ответ персонализирован (реальные
+        # solved/accuracy пользователя) — явно помечаем no-store, чтобы
+        # CDN/браузер точно не закэшировали чужую статистику по ошибке.
+        if user is None:
+            response.headers["Cache-Control"] = "public, max-age=60, s-maxage=300, stale-while-revalidate=600"
+        else:
+            response.headers["Cache-Control"] = "private, no-store"
+
         return [stats[s.id] for s in subjects]
 
 
 @router.get("/subjects/{slug}/topics", response_model=list[TopicOut], dependencies=[Depends(rate_limit(60, 60))])
-async def list_topics(slug: str, user: User | None = Depends(get_current_user_optional)) -> list[TopicOut]:
+async def list_topics(slug: str, response: Response, user: User | None = Depends(get_current_user_optional)) -> list[TopicOut]:
     async with async_session() as session:
         subject = (
             await session.execute(select(Subject).where(Subject.slug == slug))
@@ -263,6 +278,15 @@ async def list_topics(slug: str, user: User | None = Depends(get_current_user_op
         result = [build_topic_out(t.id, t.name, t.difficulty, t.task_number, t.task_number_to) for t in topics]
         if totals.get(None, 0) > 0:
             result.append(build_topic_out(None, "Без темы"))
+
+        # См. комментарий в list_subjects выше — тот же принцип: гостевой
+        # ответ одинаков для всех, кэшируем на CDN; авторизованный —
+        # персонализирован, no-store.
+        if user is None:
+            response.headers["Cache-Control"] = "public, max-age=60, s-maxage=300, stale-while-revalidate=600"
+        else:
+            response.headers["Cache-Control"] = "private, no-store"
+
         return result
 
 
