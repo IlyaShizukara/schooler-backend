@@ -113,45 +113,47 @@ def _display_correct_answer(raw: str | None) -> str | None:
 async def _load_all_subject_stats(
     session, user_telegram_id: int | None
 ) -> tuple[list[Subject], dict[int, SubjectOut]]:
-    """Считает статистику по ВСЕМ предметам за 3 запроса вместо 4 запросов
-    на каждый предмет по отдельности (было 44 запроса на 11 предметов —
-    самая частая причина «долго грузит» при росте банка заданий).
+    """Считает статистику по ВСЕМ предметам за минимальное число запросов
+    вместо 4 запросов на каждый предмет по отдельности (было 44 запроса на
+    11 предметов — самая частая причина «долго грузит» при росте банка
+    заданий).
+
+    Дальнейшая оптимизация: totals и total_points_by_subject идут по одному
+    и тому же GROUP BY Task.subject_id без Attempt — объединены в один
+    запрос. То же для solved и attempts_raw — оба идут по одному и тому же
+    JOIN Attempt-Task с одним и тем же WHERE/GROUP BY, отличается только
+    агрегируемое выражение — тоже объединены в один запрос. Итого для
+    авторизованного пользователя: было 5 последовательных round-trip'ов
+    (subjects, totals, total_points, solved, attempts_raw), стало 3
+    (subjects, totals+points, solved+attempts). Каждый round-trip на
+    serverless + внешний Postgres — это реальная сетевая задержка, а не
+    просто "работа БД", так что меньше запросов = быстрее даже при том же
+    объёме данных.
 
     user_telegram_id=None (гость): пропускаем запросы по Attempt целиком —
     у гостя прогресса нет по определению (не сохраняем), нет смысла даже
-    ходить в БД за solved/accuracy — сразу отдаём банк заданий с нулями."""
+    ходить в БД за solved/accuracy — сразу отдаём банк заданий с нулями.
+    """
     subjects = (await session.execute(select(Subject).order_by(Subject.id))).scalars().all()
 
-    totals = dict(
-        (await session.execute(
-            select(Task.subject_id, func.count(Task.id)).group_by(Task.subject_id)
-        )).all()
-    )
-
-    total_points_by_subject = dict(
-        (await session.execute(
-            select(Task.subject_id, func.sum(Task.points)).group_by(Task.subject_id)
-        )).all()
-    )
+    totals_and_points_raw = (
+        await session.execute(
+            select(Task.subject_id, func.count(Task.id), func.sum(Task.points))
+            .group_by(Task.subject_id)
+        )
+    ).all()
+    totals = {row[0]: row[1] for row in totals_and_points_raw}
+    total_points_by_subject = {row[0]: row[2] for row in totals_and_points_raw}
 
     if user_telegram_id is None:
         solved: dict[int, int] = {}
         attempts: dict[int, tuple[int, int]] = {}
     else:
-        solved = dict(
-            (await session.execute(
-                select(Task.subject_id, func.count(func.distinct(Attempt.task_id)))
-                .select_from(Attempt)
-                .join(Task, Task.id == Attempt.task_id)
-                .where(Attempt.user_telegram_id == user_telegram_id)
-                .group_by(Task.subject_id)
-            )).all()
-        )
-
-        attempts_raw = (
+        subject_agg_raw = (
             await session.execute(
                 select(
                     Task.subject_id,
+                    func.count(func.distinct(Attempt.task_id)),
                     func.count(Attempt.id),
                     func.sum(case((Attempt.is_correct.is_(True), 1), else_=0)),
                 )
@@ -161,7 +163,8 @@ async def _load_all_subject_stats(
                 .group_by(Task.subject_id)
             )
         ).all()
-        attempts = {row[0]: (row[1], row[2] or 0) for row in attempts_raw}
+        solved = {row[0]: row[1] for row in subject_agg_raw}
+        attempts = {row[0]: (row[2], row[3] or 0) for row in subject_agg_raw}
 
     stats: dict[int, SubjectOut] = {}
     for s in subjects:
@@ -203,23 +206,18 @@ async def list_topics(slug: str, user: User | None = Depends(get_current_user_op
             )
         ).scalars().all()
 
-        # totals/solved/attempts посчитаны сразу по всем темам предмета (3 запроса,
-        # не по одному на тему) — ключ None соответствует заданиям без темы
-        totals = dict(
-            (await session.execute(
-                select(Task.topic_id, func.count(Task.id))
+        # totals и points_by_topic объединены в один запрос (тот же GROUP BY
+        # Task.topic_id, без Attempt) — как и в _load_all_subject_stats выше.
+        # ключ None соответствует заданиям без темы.
+        totals_and_points_raw = (
+            await session.execute(
+                select(Task.topic_id, func.count(Task.id), func.sum(Task.points))
                 .where(Task.subject_id == subject.id)
                 .group_by(Task.topic_id)
-            )).all()
-        )
-
-        points_by_topic = dict(
-            (await session.execute(
-                select(Task.topic_id, func.sum(Task.points))
-                .where(Task.subject_id == subject.id)
-                .group_by(Task.topic_id)
-            )).all()
-        )
+            )
+        ).all()
+        totals = {row[0]: row[1] for row in totals_and_points_raw}
+        points_by_topic = {row[0]: row[2] for row in totals_and_points_raw}
 
         if user is None:
             # Гость: без персонализации, аналогично _load_all_subject_stats —
@@ -227,20 +225,14 @@ async def list_topics(slug: str, user: User | None = Depends(get_current_user_op
             solved: dict[int | None, int] = {}
             attempts: dict[int | None, tuple[int, int]] = {}
         else:
-            solved = dict(
-                (await session.execute(
-                    select(Task.topic_id, func.count(func.distinct(Attempt.task_id)))
-                    .select_from(Attempt)
-                    .join(Task, Task.id == Attempt.task_id)
-                    .where(Task.subject_id == subject.id, Attempt.user_telegram_id == user.telegram_id)
-                    .group_by(Task.topic_id)
-                )).all()
-            )
-
-            attempts_raw = (
+            # solved и attempts объединены в один запрос — тот же JOIN
+            # Attempt-Task с тем же WHERE/GROUP BY, отличаются только
+            # агрегируемые выражения (как и для предметов выше).
+            topic_agg_raw = (
                 await session.execute(
                     select(
                         Task.topic_id,
+                        func.count(func.distinct(Attempt.task_id)),
                         func.count(Attempt.id),
                         func.sum(case((Attempt.is_correct.is_(True), 1), else_=0)),
                     )
@@ -250,7 +242,8 @@ async def list_topics(slug: str, user: User | None = Depends(get_current_user_op
                     .group_by(Task.topic_id)
                 )
             ).all()
-            attempts = {row[0]: (row[1], row[2] or 0) for row in attempts_raw}
+            solved = {row[0]: row[1] for row in topic_agg_raw}
+            attempts = {row[0]: (row[2], row[3] or 0) for row in topic_agg_raw}
 
         def build_topic_out(
             topic_id: int | None, name: str, difficulty: str | None = None,
@@ -421,23 +414,42 @@ async def progress_summary(user: User = Depends(get_current_user)) -> ProgressSu
         by_subject = [stats[s.id] for s in subjects]
 
         total_solved = sum(s.solved for s in by_subject)
-        total_attempts = await session.scalar(
-            select(func.count()).select_from(Attempt).where(Attempt.user_telegram_id == user.telegram_id)
-        ) or 0
-        total_correct = await session.scalar(
+
+        # total_attempts, total_correct и probniks_count раньше были тремя
+        # отдельными await session.scalar(...) подряд — три отдельных
+        # round-trip'а к БД, хотя ни один не зависит от результата другого.
+        # Скалярные подзапросы (scalar_subquery) позволяют посчитать все три
+        # значения одним SELECT — сама БД выполнит три подзапроса, но это
+        # один round-trip с точки зрения serverless-функции, а не три.
+        attempts_count_subq = (
+            select(func.count())
+            .select_from(Attempt)
+            .where(Attempt.user_telegram_id == user.telegram_id)
+            .scalar_subquery()
+        )
+        correct_count_subq = (
             select(func.count())
             .select_from(Attempt)
             .where(Attempt.user_telegram_id == user.telegram_id, Attempt.is_correct.is_(True))
-        ) or 0
-        accuracy = round(total_correct / total_attempts * 100) if total_attempts else 0
-
-        probniks_count = await session.scalar(
+            .scalar_subquery()
+        )
+        probniks_count_subq = (
             select(func.count())
             .select_from(ExamSession)
             .where(ExamSession.user_telegram_id == user.telegram_id, ExamSession.finished_at.is_not(None))
-        ) or 0
+            .scalar_subquery()
+        )
+        total_attempts, total_correct, probniks_count = (
+            await session.execute(select(attempts_count_subq, correct_count_subq, probniks_count_subq))
+        ).one()
+        total_attempts = total_attempts or 0
+        total_correct = total_correct or 0
+        probniks_count = probniks_count or 0
+        accuracy = round(total_correct / total_attempts * 100) if total_attempts else 0
 
-        # Активность за последние 7 дней (по дате попытки, в UTC)
+        # Активность за последние 7 дней (по дате попытки, в UTC) — отдельный
+        # запрос: группировка по дате не сводится к скалярному подзапросу
+        # так же просто, как три числа выше, оставляем как есть.
         today = dt.datetime.now(dt.timezone.utc).date()
         week_start = today - dt.timedelta(days=6)
         rows = (
