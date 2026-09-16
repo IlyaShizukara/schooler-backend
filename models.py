@@ -276,3 +276,47 @@ class ProbnikPart2Grade(Base):
     graded_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: dt.datetime.now(dt.timezone.utc)
     )
+
+
+class ChatSession(Base):
+    """Один диалог с ИИ-репетитором.
+
+    Для чата по конкретному заданию (task_id задан) — один сеанс на пару
+    (пользователь, задание): при повторном открытии чата по этому же
+    заданию переиспользуется тот же сеанс, ученик видит предыдущую
+    переписку, а не начинает с нуля.
+
+    Для общего чата (task_id IS NULL, открыт из AiFab/сайдбара без
+    привязки к заданию) — один сквозной сеанс на пользователя, в него
+    копится вся переписка про подготовку в целом.
+
+    Новая таблица — не новая колонка в существующей — поэтому создастся
+    сама через init_db()/Base.metadata.create_all() на следующем деплое,
+    без ручного ALTER TABLE."""
+
+    __tablename__ = "chat_sessions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_telegram_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.telegram_id"), index=True)
+    task_id: Mapped[int | None] = mapped_column(ForeignKey("tasks.id"), nullable=True, index=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.timezone.utc)
+    )
+    last_message_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.timezone.utc)
+    )
+
+
+class ChatMessage(Base):
+    """Одно сообщение внутри диалога с ИИ-репетитором — и от ученика, и от
+    модели."""
+
+    __tablename__ = "chat_messages"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("chat_sessions.id"), index=True)
+    role: Mapped[str] = mapped_column(String(16))  # "user" | "assistant"
+    content: Mapped[str] = mapped_column(Text)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.timezone.utc)
+    )
