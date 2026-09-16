@@ -6,9 +6,11 @@
 
 Два режима в одном эндпоинте:
   - task_id передан → объяснение конкретного задания/ошибки. Материал
-    задания (вопрос, правильный ответ, эталон/критерии) подмешивается в
-    последнее сообщение пользователя — модель обязана объяснять СТРОГО по
-    нему, не придумывая другие числа или факты.
+    задания (вопрос, правильный ответ, эталон/критерии, а также последняя
+    попытка ЭТОГО ученика — что он ответил и было ли это верно) подмешивается
+    в сообщение пользователя — модель обязана объяснять СТРОГО по нему и
+    фокусироваться на конкретной ошибке ученика, не придумывая другие числа
+    или факты.
   - task_id не передан → свободный чат по темам подготовки к экзаменам.
 
 Доступен только залогиненным (см. get_current_user, не optional-версия) —
@@ -29,7 +31,7 @@ from sqlalchemy import select
 
 from auth_dependency import get_current_user
 from db import async_session
-from models import ChatMessage, ChatSession, Subject, Task, User, UserProfile
+from models import Attempt, ChatMessage, ChatSession, Subject, Task, TaskType, User, UserProfile
 from rate_limit import rate_limit
 
 logger = logging.getLogger("ai_tutor")
@@ -68,7 +70,12 @@ _BASE_SYSTEM_PROMPT = (
     "в сообщении есть блок «Материал задания» — используй ТОЛЬКО факты из "
     "него (условие, правильный ответ, эталон, критерии) и не придумывай "
     "других чисел или фактов, которых там нет; если материала не хватает "
-    "для точного объяснения — честно скажи об этом, а не выдумывай. "
+    "для точного объяснения — честно скажи об этом, а не выдумывай. Если "
+    "в материале указан «Ответ ученика на это задание» — это именно то, "
+    "что ответил ученик, и именно на этой конкретной ошибке нужно "
+    "сфокусироваться: покажи, на каком шаге и почему его ответ разошёлся "
+    "с правильным, а не объясняй решение с нуля так, будто не знаешь, что "
+    "он уже пробовал. "
     "Отвечай простым текстом с переносами строк, без markdown-таблиц и "
     "заголовков — это чат, а не документ.\n\n"
     "Метод объяснения — сократический, не выдавай сразу готовое решение. "
@@ -134,7 +141,7 @@ class ChatHistoryMessageOut(BaseModel):
     content: str
 
 
-async def _build_task_context(session, task_id: int) -> str | None:
+async def _build_task_context(session, task_id: int, user_telegram_id: int) -> str | None:
     """Собирает текстовое описание задания для подмешивания в промпт.
     Возвращает None, если задания с таким id не существует.
 
@@ -171,6 +178,33 @@ async def _build_task_context(session, task_id: int) -> str | None:
 
     if task.explanation:
         lines.append(f"Пояснение: {task.explanation}")
+
+    # ⚠️ Раньше здесь заканчивалось — модель знала правильный ответ, но НЕ
+    # знала, что конкретно ответил ученик. В итоге "Объясни мою ошибку"
+    # объяснялось с нуля, а не указанием на саму ошибку. Теперь подмешиваем
+    # последнюю попытку ЭТОГО ученика по ЭТОМУ заданию (Attempt уже
+    # отфильтрован по user_telegram_id — чужие попытки увидеть невозможно).
+    last_attempt = (
+        await session.execute(
+            select(Attempt)
+            .where(Attempt.task_id == task_id, Attempt.user_telegram_id == user_telegram_id)
+            .order_by(Attempt.answered_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+
+    if last_attempt is not None:
+        if (
+            task.task_type == TaskType.mcq
+            and last_attempt.selected_index is not None
+            and task.options
+            and 0 <= last_attempt.selected_index < len(task.options)
+        ):
+            given_answer = task.options[last_attempt.selected_index]
+        else:
+            given_answer = last_attempt.answer_text or "—"
+        verdict = "верно" if last_attempt.is_correct else "неверно"
+        lines.append(f"Ответ ученика на это задание: {given_answer} ({verdict})")
 
     return "\n".join(lines)
 
@@ -256,7 +290,7 @@ async def chat(payload: ChatIn, user: User = Depends(get_current_user)) -> Strea
 
         context = None
         if payload.task_id is not None:
-            context = await _build_task_context(session, payload.task_id)
+            context = await _build_task_context(session, payload.task_id, user.telegram_id)
             if context is None:
                 raise HTTPException(status_code=404, detail="Задание не найдено")
 
