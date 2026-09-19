@@ -158,9 +158,6 @@ async def _call_geometry_extraction(problem_text: str) -> GeometryExtraction | N
         # Completion API в проекте; ответ ожидается одним JSON-объектом с
         # тем же полем result.alternatives[0].message.text, что и в
         # потоковом режиме в ai_tutor.py, просто без построчной генерации.
-        # ⚠️ Не проверено вживую на реальном трафике — если форма ответа при
-        # stream=False у Яндекса отличается, парсинг ниже нужно будет
-        # поправить по логам первого же реального вызова.
         "completionOptions": {"stream": False, "temperature": 0.0, "maxTokens": "500"},
         "messages": [
             {"role": "system", "text": _GEOMETRY_EXTRACTION_PROMPT},
@@ -169,6 +166,7 @@ async def _call_geometry_extraction(problem_text: str) -> GeometryExtraction | N
     }
     headers = {"Authorization": f"Api-Key {YANDEX_API_KEY}", "Content-Type": "application/json"}
 
+    raw_text: str | None = None
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(YANDEX_COMPLETION_URL, json=request_body, headers=headers)
@@ -177,11 +175,23 @@ async def _call_geometry_extraction(problem_text: str) -> GeometryExtraction | N
         extraction = GeometryExtraction.model_validate(json.loads(raw_text))
     except Exception:
         # Сюда попадает и сетевая ошибка, и невалидный JSON от модели, и
-        # несоответствие схеме (model_validator выше) — во всех случаях
-        # одинаково: считаем, что построить модель не получилось, логируем
-        # для отладки промпта, ученику просто не показываем кнопку 3D.
-        logger.exception("Не удалось извлечь геометрию задачи")
+        # несоответствие схеме (model_validator выше). raw_text в логе —
+        # чтобы по логам было видно РОВНО то, что вернул Yandex, а не
+        # гадать: сама форма ответа при stream=False не проверена вживую
+        # (см. комментарий выше), а если форма верна — полезно увидеть,
+        # на чём именно модель не выдержала строгий JSON-формат.
+        logger.exception("Не удалось извлечь геометрию задачи; сырой ответ модели: %r", raw_text)
         return None
+
+    # Логируем ВСЕГДА, а не только при провале ниже порога — иначе
+    # "модель уверенно распознала неправильную пирамиду и честно дала
+    # confidence 0.2" и "ответ не распарсился" выглядят снаружи одинаково
+    # ("Не получилось построить модель"), и без этой строки в логах нельзя
+    # понять, какой из двух случаев произошёл на самом деле.
+    logger.info(
+        "Извлечение геометрии: solid=%s base=%s confidence=%.2f (порог %.2f)",
+        extraction.solid, extraction.base_shape, extraction.confidence, CONFIDENCE_THRESHOLD,
+    )
 
     if extraction.confidence < CONFIDENCE_THRESHOLD:
         return None
