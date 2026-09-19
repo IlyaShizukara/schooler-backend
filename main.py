@@ -315,6 +315,12 @@ async def auth_webapp(payload: WebAppAuthIn) -> SessionStatusResponse:
 
 
 
-@app.get("/api/health")
+@app.api_route("/api/health", methods=["GET", "HEAD"])
 async def health() -> dict:
+    # methods=["GET", "HEAD"] явно — некоторые внешние keep-warm/uptime
+    # пинг-сервисы (например, UptimeRobot на бесплатном плане) по умолчанию
+    # шлют HEAD, а не GET. FastAPI/Starlette обычно сами добавляют HEAD к
+    # GET-роуту автоматически, но на serverless-адаптере Vercel это не всегда
+    # доезжает предсказуемо — явное перечисление методов надёжнее и не
+    # зависит от версии/адаптера.
     return {"ok": True}
