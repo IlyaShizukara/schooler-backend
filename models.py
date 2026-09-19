@@ -320,3 +320,23 @@ class ChatMessage(Base):
     created_at: Mapped[dt.datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: dt.datetime.now(dt.timezone.utc)
     )
+
+
+class TaskGeometryCache(Base):
+    """Закэшированный результат извлечения параметров 3D-геометрии для
+    задания (см. ai_geometry.py) — структурные данные (тип тела, размеры,
+    подписанные точки), полученные один раз через LLM и переиспользуемые
+    дальше без повторных вызовов API для того же задания.
+
+    extraction_json = None означает "для этого задания модель не смогла
+    уверенно построить геометрию" (не правильная пирамида/призма, или не
+    хватает размеров) — тоже кэшируем: важно не дёргать LLM заново при
+    каждом открытии чата с тем же отрицательным результатом."""
+
+    __tablename__ = "task_geometry_cache"
+
+    task_id: Mapped[int] = mapped_column(ForeignKey("tasks.id"), primary_key=True)
+    extraction_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: dt.datetime.now(dt.timezone.utc)
+    )
