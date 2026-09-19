@@ -21,6 +21,7 @@
 """
 import json
 import logging
+import re
 from typing import Literal
 
 import httpx
@@ -121,7 +122,11 @@ _GEOMETRY_EXTRACTION_PROMPT = (
     "задачу и не считай никакие координаты или производные величины — "
     "извлеки только то, что явно дано в условии текстом. "
     "Отвечай СТРОГО валидным JSON и больше ничем — ни текста до, ни текста "
-    "после, ни markdown-блока ```json, только сам объект. Схема:\n"
+    "после, ни блока в тройных обратных кавычках ``` (ни с словом json, ни "
+    "без него) — просто сам JSON-объект первым символом ответа. Массивы "
+    "пиши в обычном JSON-синтаксисе: значения через запятую БЕЗ номеров или "
+    "индексов перед ними — [\"A\",\"B\",\"C\"], а НЕ [0:\"A\",1:\"B\",2:\"C\"] "
+    "(это невалидный JSON, а не список с индексами). Схема:\n"
     '{"solid": "pyramid" | "prism", '
     '"base_shape": "equilateral_triangle" | "square" | "regular_hexagon", '
     '"base_labels": ["A","B","C", ...] — вершины основания по порядку '
@@ -151,6 +156,27 @@ _GEOMETRY_EXTRACTION_PROMPT = (
 )
 
 
+# Вопреки прямой инструкции промпта ("только JSON, без markdown-блока"),
+# YandexGPT на практике иногда всё равно оборачивает ответ в ``` (даже без
+# ```json) — срезаем.
+_CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*\n?|\n?```\s*$", re.IGNORECASE)
+
+# Вживую модель иногда пишет элементы массива с "индексом" перед значением —
+# [0: "A", 1: "B", 2: "C"] вместо валидного ["A", "B", "C"] (похоже на
+# спутанный вывод в духе Python enumerate()). Это не markdown-артефакт, а
+# по-настоящему невалидный JSON — json.loads падает на нём при любых
+# обстоятельствах. Паттерн узнаваемый (число+двоеточие сразу после '['
+# или ',') — вырезаем.
+_MALFORMED_ARRAY_INDEX_RE = re.compile(r"(?<=[\[,])\s*\d+\s*:\s*")
+
+
+def _clean_model_json(raw_text: str) -> str:
+    text = raw_text.strip()
+    text = _CODE_FENCE_RE.sub("", text).strip()
+    text = _MALFORMED_ARRAY_INDEX_RE.sub("", text)
+    return text
+
+
 async def _call_geometry_extraction(problem_text: str) -> GeometryExtraction | None:
     request_body = {
         "modelUri": MODEL_URI,
@@ -167,20 +193,25 @@ async def _call_geometry_extraction(problem_text: str) -> GeometryExtraction | N
     headers = {"Authorization": f"Api-Key {YANDEX_API_KEY}", "Content-Type": "application/json"}
 
     raw_text: str | None = None
+    cleaned_text: str | None = None
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             response = await client.post(YANDEX_COMPLETION_URL, json=request_body, headers=headers)
         response.raise_for_status()
         raw_text = response.json()["result"]["alternatives"][0]["message"]["text"]
-        extraction = GeometryExtraction.model_validate(json.loads(raw_text))
+        cleaned_text = _clean_model_json(raw_text)
+        extraction = GeometryExtraction.model_validate(json.loads(cleaned_text))
     except Exception:
-        # Сюда попадает и сетевая ошибка, и невалидный JSON от модели, и
-        # несоответствие схеме (model_validator выше). raw_text в логе —
-        # чтобы по логам было видно РОВНО то, что вернул Yandex, а не
-        # гадать: сама форма ответа при stream=False не проверена вживую
-        # (см. комментарий выше), а если форма верна — полезно увидеть,
-        # на чём именно модель не выдержала строгий JSON-формат.
-        logger.exception("Не удалось извлечь геометрию задачи; сырой ответ модели: %r", raw_text)
+        # Сюда попадает и сетевая ошибка, и невалидный JSON от модели (даже
+        # после _clean_model_json — она чинит только два известных
+        # артефакта, не любой возможный), и несоответствие схеме
+        # (model_validator в GeometryExtraction). И raw_text, и cleaned_text
+        # в логе — чтобы сразу было видно, это новый артефакт формата или
+        # сама очистка не сработала как надо.
+        logger.exception(
+            "Не удалось извлечь геометрию задачи; сырой ответ модели: %r; после очистки: %r",
+            raw_text, cleaned_text,
+        )
         return None
 
     # Логируем ВСЕГДА, а не только при провале ниже порога — иначе
